@@ -28,11 +28,11 @@ const __dirname = path.dirname(__filename);
 export async function runMigration() {
   console.log('🔄 Checking MongoDB migration status...');
 
-  // 1. Check & Migrate CMS Content
+  // 1. Check & Migrate CMS Content (Idempotent per document key)
   try {
-    const cmsCount = await LandingPageContent.countDocuments();
-    if (cmsCount === 0) {
-      console.log('📦 Migrating CMS JSON data to MongoDB...');
+    const existingCms = await LandingPageContent.findOne({ key: 'main_cms_content' }).lean();
+    if (!existingCms) {
+      console.log('📦 Seeding initial CMS JSON data to MongoDB...');
       const cmsJsonPath = path.join(__dirname, '../data/cms_database.json');
       let cmsData = null;
 
@@ -49,89 +49,101 @@ export async function runMigration() {
       const draft = cmsData?.draft || { ...defaultLandingPageContent, status: 'draft' };
       const history = Array.isArray(cmsData?.history) ? cmsData.history : [];
 
-      await LandingPageContent.create({
-        key: 'main_cms_content',
-        live,
-        draft,
-        history,
-      });
-      console.log('✅ CMS data migrated to MongoDB.');
+      await LandingPageContent.findOneAndUpdate(
+        { key: 'main_cms_content' },
+        {
+          $setOnInsert: {
+            key: 'main_cms_content',
+            live,
+            draft,
+            history,
+          },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      console.log('✅ CMS data seeded to MongoDB.');
     } else {
-      console.log(`ℹ️ CMS collection already populated (${cmsCount} record).`);
+      console.log('ℹ️ CMS collection already populated (1 record) - skipped.');
     }
   } catch (err) {
     console.error('❌ CMS migration error:', err.message);
   }
 
-  // 2. Check & Migrate Accounting Database
+  // 2. Check & Migrate Accounting Database (Granular per-collection idempotency)
   try {
-    const accountCount = await Account.countDocuments();
-    if (accountCount === 0) {
-      console.log('📦 Migrating Accounting JSON data to MongoDB...');
-      const acctJsonPath = path.join(__dirname, '../data/accounting_database.json');
-      let acctData = defaultAccountingData;
+    const acctJsonPath = path.join(__dirname, '../data/accounting_database.json');
+    let acctData = defaultAccountingData;
 
-      if (fs.existsSync(acctJsonPath)) {
-        try {
-          const raw = fs.readFileSync(acctJsonPath, 'utf-8');
-          acctData = JSON.parse(raw);
-        } catch (e) {
-          console.warn('⚠️ Could not parse accounting_database.json, using default seed:', e.message);
+    if (fs.existsSync(acctJsonPath)) {
+      try {
+        const raw = fs.readFileSync(acctJsonPath, 'utf-8');
+        acctData = JSON.parse(raw);
+      } catch (e) {
+        console.warn('⚠️ Could not parse accounting_database.json, using default seed:', e.message);
+      }
+    }
+
+    // 2a. Accounting Settings
+    const existingSettings = await AccountingSetting.findOne({ key: 'main_settings' }).lean();
+    if (!existingSettings) {
+      const settings = acctData.settings || defaultAccountingData.settings;
+      await AccountingSetting.findOneAndUpdate(
+        { key: 'main_settings' },
+        {
+          $setOnInsert: {
+            key: 'main_settings',
+            ...settings,
+          },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      console.log('✅ Accounting settings seeded.');
+    }
+
+    // 2b. Granular check for each accounting collection
+    const accountingCollections = [
+      { key: 'accounts', model: Account, name: 'Account' },
+      { key: 'parties', model: Party, name: 'Party' },
+      { key: 'items', model: Item, name: 'Item' },
+      { key: 'salesQuotes', model: SalesQuote, name: 'SalesQuote' },
+      { key: 'salesInvoices', model: SalesInvoice, name: 'SalesInvoice' },
+      { key: 'salesPayments', model: SalesPayment, name: 'SalesPayment' },
+      { key: 'purchaseInvoices', model: PurchaseInvoice, name: 'PurchaseInvoice' },
+      { key: 'purchasePayments', model: PurchasePayment, name: 'PurchasePayment' },
+      { key: 'journalEntries', model: JournalEntry, name: 'JournalEntry' },
+      { key: 'ledgerEntries', model: LedgerEntry, name: 'LedgerEntry' },
+      { key: 'taxTemplates', model: TaxTemplate, name: 'TaxTemplate' },
+      { key: 'paymentMethods', model: PaymentMethod, name: 'PaymentMethod' },
+      { key: 'printTemplates', model: PrintTemplate, name: 'PrintTemplate' },
+    ];
+
+    let collectionsSeededCount = 0;
+    let seededAccountsOrLedger = false;
+
+    for (const { key, model, name } of accountingCollections) {
+      const count = await model.countDocuments();
+      if (count === 0) {
+        const seedItems = acctData[key];
+        if (Array.isArray(seedItems) && seedItems.length > 0) {
+          await model.insertMany(seedItems, { ordered: false });
+          console.log(`📦 Seeded ${seedItems.length} records into ${name}.`);
+          collectionsSeededCount++;
+          if (name === 'Account' || name === 'LedgerEntry') {
+            seededAccountsOrLedger = true;
+          }
         }
       }
+    }
 
-      // Populate Settings
-      const settings = acctData.settings || defaultAccountingData.settings;
-      await AccountingSetting.create({
-        key: 'main_settings',
-        ...settings,
-      });
-
-      // Populate collections safely
-      if (Array.isArray(acctData.accounts) && acctData.accounts.length > 0) {
-        await Account.insertMany(acctData.accounts);
-      }
-      if (Array.isArray(acctData.parties) && acctData.parties.length > 0) {
-        await Party.insertMany(acctData.parties);
-      }
-      if (Array.isArray(acctData.items) && acctData.items.length > 0) {
-        await Item.insertMany(acctData.items);
-      }
-      if (Array.isArray(acctData.salesQuotes) && acctData.salesQuotes.length > 0) {
-        await SalesQuote.insertMany(acctData.salesQuotes);
-      }
-      if (Array.isArray(acctData.salesInvoices) && acctData.salesInvoices.length > 0) {
-        await SalesInvoice.insertMany(acctData.salesInvoices);
-      }
-      if (Array.isArray(acctData.salesPayments) && acctData.salesPayments.length > 0) {
-        await SalesPayment.insertMany(acctData.salesPayments);
-      }
-      if (Array.isArray(acctData.purchaseInvoices) && acctData.purchaseInvoices.length > 0) {
-        await PurchaseInvoice.insertMany(acctData.purchaseInvoices);
-      }
-      if (Array.isArray(acctData.purchasePayments) && acctData.purchasePayments.length > 0) {
-        await PurchasePayment.insertMany(acctData.purchasePayments);
-      }
-      if (Array.isArray(acctData.journalEntries) && acctData.journalEntries.length > 0) {
-        await JournalEntry.insertMany(acctData.journalEntries);
-      }
-      if (Array.isArray(acctData.ledgerEntries) && acctData.ledgerEntries.length > 0) {
-        await LedgerEntry.insertMany(acctData.ledgerEntries);
-      }
-      if (Array.isArray(acctData.taxTemplates) && acctData.taxTemplates.length > 0) {
-        await TaxTemplate.insertMany(acctData.taxTemplates);
-      }
-      if (Array.isArray(acctData.paymentMethods) && acctData.paymentMethods.length > 0) {
-        await PaymentMethod.insertMany(acctData.paymentMethods);
-      }
-      if (Array.isArray(acctData.printTemplates) && acctData.printTemplates.length > 0) {
-        await PrintTemplate.insertMany(acctData.printTemplates);
-      }
-
+    if (seededAccountsOrLedger) {
       await accountingEngine.recalculateBalances();
-      console.log('✅ Accounting data migrated to MongoDB successfully.');
+      console.log('✅ Accounting initial balances calculated.');
+    }
+
+    if (collectionsSeededCount === 0) {
+      console.log('ℹ️ All Accounting collections already populated - skipped.');
     } else {
-      console.log(`ℹ️ Accounting collections already populated (${accountCount} accounts).`);
+      console.log(`✅ Accounting migration complete (${collectionsSeededCount} collections initialized).`);
     }
   } catch (err) {
     console.error('❌ Accounting migration error:', err.message);
