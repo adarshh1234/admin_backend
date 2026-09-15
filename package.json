@@ -1,0 +1,18 @@
+{
+  "name": "letgetin-backend",
+  "version": "1.0.0",
+  "description": "Backend API for LetGetIn CMS and Landing Page integration",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mongoose": "^8.24.4",
+    "multer": "^1.4.5-lts.1"
+  }
+}
